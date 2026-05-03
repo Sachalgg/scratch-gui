@@ -4,6 +4,10 @@ import storage from '../lib/storage';
 const SET_VM = 'scratch-gui/vm/SET_VM';
 const defaultVM = new VM();
 defaultVM.attachStorage(storage);
+// Codaquest LMS bridge — exposes the singleton VM so cq-bridge.js can drive it
+if (typeof window !== 'undefined') {
+    window.ScratchVM = defaultVM;
+}
 const initialState = defaultVM;
 
 const reducer = function (state, action) {
