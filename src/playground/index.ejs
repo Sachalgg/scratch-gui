@@ -23,7 +23,7 @@
       <noscript><iframe src="https://www.googletagmanager.com/ns.html?id=<%- htmlWebpackPlugin.options.gtm_id %><%= htmlWebpackPlugin.options.gtm_env_auth %>" height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
       <!-- End Google Tag Manager (noscript) -->
     <% } %>
-    <!-- Codaquest LMS bridge — postMessage glue between this iframe and the LMS -->
+    <!-- Codaquest LMS bridge — adds a "Save to Mes projets" button that POSTs the .sb3 to codabox.codaquest.com -->
     <script src="static/cq-bridge.js"></script>
   </body>
 </html>

@@ -1,78 +1,45 @@
 /**
- * cq-bridge.js — Codaquest LMS ↔ scratch-gui postMessage bridge.
+ * cq-bridge.js — standalone "Save to Codaquest" button for scratch.codaquest.com.
  *
- * Drop into your scratch-gui fork at `static/cq-bridge.js` and load it from
+ * Drop into the scratch-gui fork at `static/cq-bridge.js` and load it from
  * `src/playground/index.ejs` just before </body>:
  *
  *   <script src="<%= htmlWebpackPlugin.options.publicPath %>cq-bridge.js"></script>
  *
  * Requires the fork to expose the scratch-vm instance on `window.ScratchVM`.
- * In an unmodified scratch-gui you can do this by editing
- * `src/lib/vm-manager-hoc.jsx` (or your fork's equivalent VM setup) to add:
+ * In an unmodified scratch-gui, edit `src/lib/vm-manager-hoc.jsx` (or wherever
+ * the VM is constructed) to add:
  *
  *   const vm = new VirtualMachine();
- *   window.ScratchVM = vm;       // <-- add this line
+ *   window.ScratchVM = vm;
  *
- * The contract is the mirror of `lib/scratch-bridge.ts` in the LMS repo:
- *
- *   LMS → editor:  scratch:loadProject, scratch:requestExport,
- *                  scratch:saveDone, scratch:theme
- *   editor → LMS:  scratch:ready, scratch:exportData, scratch:saveRequest,
- *                  scratch:error
- *
- * Bundle envelope (transport JSON over postMessage):
- *
- *   {
- *     projectJson: <scratch-vm project.json>,
- *     assets: { "<md5ext>": { data: "<base64>", contentType: "image/svg+xml" } }
- *   }
- *
- * The bridge does nothing if the page isn't iframed (no parent or same window).
+ * What this does:
+ *   - Mounts a floating "Sauvegarder dans Mes projets" button in the page.
+ *   - On click, asks scratch-vm for an .sb3 zip blob and POSTs it to the LMS
+ *     at https://codabox.codaquest.com/api/projects/scratch-save with
+ *     credentials: 'include'. The .codaquest.com Supabase session cookie is
+ *     sent automatically because both subdomains share the registrable domain.
+ *   - Remembers the LMS-returned project id in localStorage so subsequent
+ *     saves update the same row instead of creating duplicates.
  */
 
 (function () {
   'use strict';
 
-  if (window === window.parent) {
-    // Not iframed — running standalone, nothing to wire up
-    return;
-  }
+  var LMS_ORIGIN = 'https://codabox.codaquest.com';
+  var SAVE_URL = LMS_ORIGIN + '/api/projects/scratch-save';
+  var STORAGE_KEY = 'cq_scratch_project_id';
 
-  var ALLOWED_PARENT_ORIGINS = [
-    // Edit to match your LMS deployments
-    'https://codabox.codaquest.com',
-    'https://codaquest.com',
-    'https://www.codaquest.com',
-    'http://localhost:3001',
-  ];
-
-  function parentOriginAllowed(origin) {
-    return ALLOWED_PARENT_ORIGINS.indexOf(origin) !== -1 ||
-      // Any *.codaquest.com subdomain (codabox, future LMS subdomains)
-      /^https:\/\/[a-z0-9-]+\.codaquest\.com$/i.test(origin) ||
-      // Vercel preview URLs of the LMS
-      /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
-  }
-
-  function postToParent(msg) {
-    // We don't know the parent origin until we receive a message; until then,
-    // broadcast with '*' for `ready` only. After that, prefer the captured one.
-    var target = capturedParentOrigin || '*';
-    window.parent.postMessage(msg, target);
-  }
-
-  var capturedParentOrigin = null;
-  var vmReadyPromise = waitForVM();
+  // ── Wait for scratch-vm to be available ─────────────────────────────────
 
   function waitForVM() {
     return new Promise(function (resolve) {
       var tries = 0;
       var iv = setInterval(function () {
-        if (window.ScratchVM && typeof window.ScratchVM.runtime === 'object') {
+        if (window.ScratchVM && typeof window.ScratchVM.saveProjectSb3 === 'function') {
           clearInterval(iv);
           resolve(window.ScratchVM);
         } else if (tries++ > 200) {
-          // ~20 s — give up but still resolve so callers don't hang forever
           clearInterval(iv);
           resolve(null);
         }
@@ -80,172 +47,124 @@
     });
   }
 
-  // ── Asset bundle helpers ──────────────────────────────────────────────────
+  // ── Project title — read from the GUI's redux store, fall back gracefully ─
 
-  function uint8ToBase64(u8) {
-    var CHUNK = 0x8000;
-    var out = '';
-    for (var i = 0; i < u8.length; i += CHUNK) {
-      out += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
-    }
-    return btoa(out);
-  }
-
-  function base64ToUint8(b64) {
-    var bin = atob(b64);
-    var u8 = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-    return u8;
-  }
-
-  function collectAssets(vm) {
-    // scratch-vm tracks every loaded asset on its storage runtime
-    var storage = vm.runtime.storage;
-    var bundle = {};
-    if (!storage) return bundle;
-
-    function takeFromTarget(target) {
-      var allMedia = (target.sprite ? target.sprite.costumes : []).concat(
-        target.sprite ? target.sprite.sounds : [],
-      );
-      for (var i = 0; i < allMedia.length; i++) {
-        var m = allMedia[i];
-        if (!m || !m.md5) continue;
-        var md5ext = m.md5; // already includes extension (e.g. "abcd.svg")
-        if (bundle[md5ext]) continue;
-        var asset = m.asset;
-        if (!asset || !asset.data) continue;
-        bundle[md5ext] = {
-          data: uint8ToBase64(asset.data),
-          contentType: asset.assetType ? asset.assetType.contentType : 'application/octet-stream',
-        };
-      }
-    }
-
-    var targets = vm.runtime.targets || [];
-    for (var t = 0; t < targets.length; t++) takeFromTarget(targets[t]);
-    return bundle;
-  }
-
-  function loadAssets(vm, assets) {
-    var storage = vm.runtime.storage;
-    if (!storage || !assets) return;
-    var keys = Object.keys(assets);
-    for (var i = 0; i < keys.length; i++) {
-      var md5ext = keys[i];
-      var entry = assets[md5ext];
-      if (!entry || !entry.data) continue;
-      var dot = md5ext.lastIndexOf('.');
-      var md5 = dot >= 0 ? md5ext.slice(0, dot) : md5ext;
-      var ext = dot >= 0 ? md5ext.slice(dot + 1) : '';
-      var assetType =
-        ext === 'svg' ? storage.AssetType.ImageVector :
-        ext === 'png' || ext === 'jpg' || ext === 'jpeg' ? storage.AssetType.ImageBitmap :
-        ext === 'wav' || ext === 'mp3' ? storage.AssetType.Sound :
-        storage.AssetType.ImageBitmap;
-      var dataFmt =
-        ext === 'svg' ? storage.DataFormat.SVG :
-        ext === 'png' ? storage.DataFormat.PNG :
-        ext === 'jpg' || ext === 'jpeg' ? storage.DataFormat.JPG :
-        ext === 'wav' ? storage.DataFormat.WAV :
-        ext === 'mp3' ? storage.DataFormat.MP3 :
-        storage.DataFormat.PNG;
-      try {
-        storage.createAsset(assetType, dataFmt, base64ToUint8(entry.data), md5, true);
-      } catch (e) {
-        // Non-fatal — asset will fail to render but the rest loads
-      }
-    }
-  }
-
-  function exportBundle(vm) {
-    var json;
+  function readTitle() {
     try {
-      json = vm.toJSON();
-    } catch (e) {
-      throw new Error('vm.toJSON() failed: ' + (e && e.message));
+      var store = window.__SCRATCHGUI_STORE__ || window.ReduxStore;
+      if (store && typeof store.getState === 'function') {
+        var s = store.getState();
+        if (s && s.scratchGui && s.scratchGui.projectTitle) {
+          return s.scratchGui.projectTitle;
+        }
+      }
+    } catch (e) { /* fall through */ }
+    var titleInput = document.querySelector('input[class*="title-field"]');
+    if (titleInput && titleInput.value) return titleInput.value;
+    return 'Projet Scratch';
+  }
+
+  // ── Save flow ───────────────────────────────────────────────────────────
+
+  function setStatus(node, msg, kind) {
+    node.textContent = msg;
+    node.dataset.kind = kind || 'idle';
+  }
+
+  async function save(button, status) {
+    var vm = window.ScratchVM;
+    if (!vm) {
+      setStatus(status, 'Editeur pas encore prêt', 'error');
+      return;
     }
-    var projectJson = typeof json === 'string' ? JSON.parse(json) : json;
-    return {
-      projectJson: projectJson,
-      assets: collectAssets(vm),
-    };
-  }
+    button.disabled = true;
+    setStatus(status, 'Sauvegarde…', 'progress');
 
-  function loadBundle(vm, bundle) {
-    if (!bundle || !bundle.projectJson) return Promise.reject(new Error('empty bundle'));
-    loadAssets(vm, bundle.assets || {});
-    var jsonString = JSON.stringify(bundle.projectJson);
-    // scratch-vm accepts a JSON string or an .sb3 ArrayBuffer
-    return vm.loadProject(jsonString);
-  }
-
-  // ── Theme application ────────────────────────────────────────────────────
-
-  function applyTheme(theme) {
-    var dark = theme === 'dark';
-    document.body.classList.toggle('cq-theme-dark', dark);
-    document.documentElement.classList.toggle('cq-theme-dark', dark);
-    // If your fork has its own theming hooks, hook them in here.
     try {
-      window.dispatchEvent(new CustomEvent('cq-theme-change', { detail: { theme: theme } }));
-    } catch (e) { /* IE-era browsers — ignore */ }
+      // saveProjectSb3 returns a Promise<Blob> in scratch-vm 0.2+.
+      var blob = await vm.saveProjectSb3();
+      if (!(blob instanceof Blob)) {
+        throw new Error('vm.saveProjectSb3() did not return a Blob');
+      }
+      var form = new FormData();
+      form.append('file', blob, 'project.sb3');
+      form.append('title', readTitle());
+      var existingId = localStorage.getItem(STORAGE_KEY);
+      if (existingId) form.append('projectId', existingId);
+
+      var res = await fetch(SAVE_URL, {
+        method: 'POST',
+        credentials: 'include',
+        body: form,
+      });
+      if (res.status === 401) {
+        setStatus(status, 'Connecte-toi sur Codaquest pour sauvegarder', 'error');
+        // Clear stale id — the user may have switched accounts.
+        localStorage.removeItem(STORAGE_KEY);
+        return;
+      }
+      if (!res.ok) {
+        var msg = 'Erreur ' + res.status;
+        try { var body = await res.json(); if (body && body.error) msg = body.error; } catch (e) { /* ignore */ }
+        throw new Error(msg);
+      }
+      var json = await res.json();
+      if (json && json.id) {
+        localStorage.setItem(STORAGE_KEY, json.id);
+      }
+      setStatus(status, 'Sauvegardé dans Mes projets', 'ok');
+    } catch (err) {
+      setStatus(status, 'Echec : ' + (err && err.message ? err.message : err), 'error');
+    } finally {
+      button.disabled = false;
+      setTimeout(function () {
+        if (status.dataset.kind !== 'error') setStatus(status, '', 'idle');
+      }, 4000);
+    }
   }
 
-  // ── Inject a "Save to Codaquest" affordance inside the editor ────────────
-  // The LMS already shows its own Save button overlaid on the iframe, so this
-  // is optional. If you want a Save action inside the editor's menu bar,
-  // implement it in your fork and have it call:
-  //   window.parent.postMessage({ type: 'scratch:saveRequest' }, '*');
+  // ── UI: floating button + status pill ───────────────────────────────────
 
-  // ── Message handler ──────────────────────────────────────────────────────
+  function mountButton() {
+    if (document.getElementById('cq-save-button')) return;
 
-  window.addEventListener('message', function (event) {
-    if (!event.data || typeof event.data !== 'object') return;
-    if (!parentOriginAllowed(event.origin)) return;
-    capturedParentOrigin = event.origin;
+    var style = document.createElement('style');
+    style.textContent =
+      '#cq-save-wrap{position:fixed;top:12px;right:12px;z-index:99999;display:flex;align-items:center;gap:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}' +
+      '#cq-save-button{background:#4D97FF;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-weight:600;font-size:14px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.15);}' +
+      '#cq-save-button:hover:not(:disabled){background:#3a85ee;}' +
+      '#cq-save-button:disabled{opacity:.6;cursor:wait;}' +
+      '#cq-save-status{font-size:13px;padding:4px 10px;border-radius:6px;background:#fff;color:#333;box-shadow:0 1px 3px rgba(0,0,0,.1);max-width:260px;}' +
+      '#cq-save-status:empty{display:none;}' +
+      '#cq-save-status[data-kind="ok"]{background:#e8f6ee;color:#1a7f37;}' +
+      '#cq-save-status[data-kind="error"]{background:#fdecea;color:#a3261a;}' +
+      '#cq-save-status[data-kind="progress"]{background:#eef4ff;color:#1d4ed8;}';
+    document.head.appendChild(style);
 
-    var type = event.data.type;
+    var wrap = document.createElement('div');
+    wrap.id = 'cq-save-wrap';
+    var status = document.createElement('div');
+    status.id = 'cq-save-status';
+    var button = document.createElement('button');
+    button.id = 'cq-save-button';
+    button.type = 'button';
+    button.textContent = 'Sauvegarder dans Mes projets';
+    button.addEventListener('click', function () { save(button, status); });
+    wrap.appendChild(status);
+    wrap.appendChild(button);
+    document.body.appendChild(wrap);
+  }
 
-    if (type === 'scratch:loadProject') {
-      vmReadyPromise.then(function (vm) {
-        if (!vm) return;
-        loadBundle(vm, event.data.bundle).catch(function (err) {
-          postToParent({ type: 'scratch:error', message: 'loadProject failed: ' + err.message });
-        });
-      });
-    } else if (type === 'scratch:requestExport') {
-      vmReadyPromise.then(function (vm) {
-        if (!vm) {
-          postToParent({ type: 'scratch:error', message: 'VM not ready' });
-          return;
-        }
-        try {
-          var bundle = exportBundle(vm);
-          postToParent({
-            type: 'scratch:exportData',
-            bundle: bundle,
-            requestId: event.data.requestId,
-          });
-        } catch (err) {
-          postToParent({ type: 'scratch:error', message: err.message });
-        }
-      });
-    } else if (type === 'scratch:saveDone') {
-      // No-op for now — could surface a toast inside the editor if desired
-    } else if (type === 'scratch:theme') {
-      applyTheme(event.data.theme === 'dark' ? 'dark' : 'light');
-    }
-  });
+  // ── Boot ────────────────────────────────────────────────────────────────
 
-  // ── Announce readiness once the VM is up ─────────────────────────────────
+  function boot() {
+    mountButton();
+    waitForVM(); // warms up; the click handler re-reads window.ScratchVM
+  }
 
-  vmReadyPromise.then(function (vm) {
-    if (vm) {
-      console.log('[cq-bridge] ready');
-      postToParent({ type: 'scratch:ready' });
-    } else {
-      console.warn('[cq-bridge] VM never appeared on window.ScratchVM');
-    }
-  });
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
 })();
