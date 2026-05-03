@@ -40,14 +40,18 @@
 
   var ALLOWED_PARENT_ORIGINS = [
     // Edit to match your LMS deployments
-    'https://codaquest.app',
-    'https://www.codaquest.app',
+    'https://codabox.codaquest.com',
+    'https://codaquest.com',
+    'https://www.codaquest.com',
     'http://localhost:3001',
   ];
 
   function parentOriginAllowed(origin) {
     return ALLOWED_PARENT_ORIGINS.indexOf(origin) !== -1 ||
-      /^https:\/\/[a-z0-9-]+\.codaquest\.app$/i.test(origin);
+      // Any *.codaquest.com subdomain (codabox, future LMS subdomains)
+      /^https:\/\/[a-z0-9-]+\.codaquest\.com$/i.test(origin) ||
+      // Vercel preview URLs of the LMS
+      /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
   }
 
   function postToParent(msg) {

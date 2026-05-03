@@ -8,7 +8,7 @@
       "headers": [
         {
           "key": "Content-Security-Policy",
-          "value": "frame-ancestors 'self' https://codaquest.app https://*.codaquest.app https://*.vercel.app http://localhost:3001"
+          "value": "frame-ancestors 'self' https://codabox.codaquest.com https://codaquest.com https://*.codaquest.com https://*.vercel.app http://localhost:3001"
         }
       ]
     }
