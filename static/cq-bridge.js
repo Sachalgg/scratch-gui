@@ -24,8 +24,9 @@
  *     https://codabox.codaquest.com/api/projects/scratch-save with
  *     credentials: 'include'. The .codaquest.com Supabase session cookie is
  *     sent automatically because both subdomains share the registrable domain.
- *     Remembers the LMS-returned project id FOR THIS PAGE LOAD so subsequent
- *     saves update the same row instead of creating duplicates.
+ *     Remembers the LMS-returned project id, in memory and mirrored into the
+ *     URL, so subsequent saves update the same row instead of creating
+ *     duplicates and a reload comes back to the same project.
  *   - OPEN. When the page is loaded as `/?cq_project=<id>` (which is what every
  *     "Ouvrir" link in Mes projets now points at), fetches that project's saved
  *     .sb3 back from the LMS and loads it into the VM before the child touches
@@ -52,24 +53,28 @@
   var PROJECT_PARAM = 'cq_project';
 
   /**
-   * Which project THIS editor session writes to, and the single most important
-   * variable in this file.
+   * Which project the canvas on screen belongs to, and the single most important
+   * variable in this file. Write it only through setTarget().
    *
-   * It is per page load, deliberately, and it is only ever set from something
-   * that happened in front of the child: a project we successfully loaded into
-   * the VM, or a project the server just created for a save they made.
+   * It is only ever set from something that happened in front of the child: a
+   * project we loaded into the VM, or a project the server just created for a
+   * save they made. Null means "I do not know what this canvas belongs to", and
+   * the only safe thing to do with an unknown canvas is let the server make a
+   * NEW project for it. A duplicate row is an annoyance. An overwritten row is
+   * lost work.
    *
-   * It used to be a localStorage id that outlived the tab, and that is a way to
-   * destroy a child's work. scratch-gui boots on the stock EMPTY project, so a
-   * kid who opened the editor the next day and pressed Save out of habit
-   * overwrote yesterday's game with a blank canvas: same project row, same R2
-   * key, real .sb3 replaced by an empty one. Nothing in the LMS could tell that
-   * apart from a legitimate save. There is a project in production right now
-   * holding nothing but the 41 KB stock empty project.
+   * What it is NOT is a memory of the last project this browser touched. That
+   * is how it used to work, as a localStorage id that outlived the tab, and it
+   * is a way to destroy a child's work: scratch-gui boots on the stock EMPTY
+   * project, so a kid who opened the editor the next day and pressed Save out
+   * of habit overwrote yesterday's game with a blank canvas. Same project row,
+   * same R2 key, real .sb3 replaced by an empty one, and nothing in the LMS
+   * could tell that apart from a legitimate save. There is a project in
+   * production right now holding nothing but the 41 KB stock empty project.
    *
-   * Null means "I do not know what this canvas belongs to", and the only safe
-   * thing to do with an unknown canvas is let the server make a NEW project for
-   * it. A duplicate row is an annoyance. An overwritten row is lost work.
+   * The distinction is what the canvas is showing. A saved id is durable
+   * because the URL mirrors it (see setProjectParam), so a reload reopens the
+   * project AND the canvas comes back with it. The two never separate.
    */
   var currentProjectId = null;
 
@@ -105,7 +110,7 @@
     if (!runtime || typeof runtime.on !== 'function') return;
     runtime.on('PROJECT_LOADED', function () {
       if (loadingOurProject) return;
-      currentProjectId = null;
+      setTarget(null);
     });
   }
 
@@ -249,26 +254,42 @@
   }
 
   /**
-   * Drop the parameter once it has been consumed, from the query AND the hash.
+   * Keep the URL naming whatever currentProjectId names, or nothing.
    *
-   * Without this, a refresh (or the browser restoring the tab) silently reloads
-   * the LAST SAVED .sb3 over whatever the child has built since, which reads as
-   * "Scratch deleted my work". Saves keep landing on the right row because the
-   * id is held in currentProjectId for the rest of this page load.
+   * That invariant is the whole point: the address bar is the only part of this
+   * that survives a reload, so it is what decides where a child lands when they
+   * press F5, restore a tab, or reopen the browser. Mirroring the write target
+   * means they come back to the project they were on, still attached to it.
+   *
+   * An earlier version DELETED the parameter after opening, on the theory that
+   * a refresh would otherwise reload the saved .sb3 over newer work. That
+   * reasoning does not survive contact with what a reload actually does: it
+   * throws away the VM's in-memory project regardless, so there is no newer
+   * work left to protect. All the deletion bought was a child who refreshed
+   * landing in a blank editor whose next save forked a duplicate row.
+   *
+   * Writes the query form and clears the hash form, which we only ever read.
    */
-  function forgetProjectParam() {
+  function setProjectParam(projectId) {
     try {
       var url = new URL(window.location.href);
-      var had = url.searchParams.has(PROJECT_PARAM);
-      url.searchParams.delete(PROJECT_PARAM);
+      var before = url.href;
+      if (projectId) url.searchParams.set(PROJECT_PARAM, projectId);
+      else url.searchParams.delete(PROJECT_PARAM);
       var hash = url.hash.replace(
         new RegExp('([#&])' + PROJECT_PARAM + '=[^&]*(&|$)'),
         '$1'
       );
-      if (!had && hash === url.hash) return;
       url.hash = hash === '#' ? '' : hash;
+      if (url.href === before) return;
       window.history.replaceState(null, '', url.toString());
     } catch (e) { /* cosmetic */ }
+  }
+
+  /** The one place currentProjectId changes, so the URL can never drift from it. */
+  function setTarget(projectId) {
+    currentProjectId = projectId || null;
+    setProjectParam(currentProjectId);
   }
 
   // ── Open flow ───────────────────────────────────────────────────────────
@@ -336,8 +357,7 @@
       // Only adopt the id once the project is actually IN the editor. Adopting
       // it earlier would point the next save at a project the child never got
       // to see, and overwrite it with an empty canvas.
-      currentProjectId = projectId;
-      forgetProjectParam();
+      setTarget(projectId);
       var title = res.headers.get('X-Codaquest-Project-Title');
       writeTitle(title ? decodeURIComponent(title) : '');
       setStatus(status, 'Projet chargé', 'ok');
@@ -380,7 +400,7 @@
         setStatus(status, 'Connecte-toi sur Codaquest pour sauvegarder', 'error');
         // The user may have switched accounts, so this canvas no longer belongs
         // to whoever signs in next.
-        currentProjectId = null;
+        setTarget(null);
         return;
       }
       if (!res.ok) {
@@ -390,7 +410,9 @@
       }
       var json = await res.json();
       if (json && json.id) {
-        currentProjectId = json.id;
+        // Including on a fork: the id changed, so the URL has to change with it
+        // or a reload sends the child back to the project they no longer own.
+        setTarget(json.id);
       }
       // `forked: true` means the id we sent was not writable (deleted, someone
       // else's, not a Scratch project) and the work landed in a NEW project.
