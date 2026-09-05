@@ -74,11 +74,39 @@
   var currentProjectId = null;
 
   /**
+   * True only while WE are the ones calling vm.loadProject, so the watcher
+   * below can tell our load apart from everyone else's.
+   */
+  var loadingOurProject = false;
+
+  /**
    * Delete the retired key so an id left by the previous version of this file
    * cannot be picked up by anything later.
    */
   function clearLegacyProjectId() {
     try { localStorage.removeItem(LEGACY_STORAGE_KEY); } catch (e) { /* private mode */ }
+  }
+
+  /**
+   * Let go of the project as soon as anything else loads a different one.
+   *
+   * scratch-gui can replace the VM's project without reloading the page:
+   * "Fichier > Nouveau" and "Charger depuis ton ordinateur" both call
+   * vm.loadProject. Holding on to the id across that is the localStorage bug
+   * again in miniature. Open your game, pick New, press Save, and the blank
+   * canvas lands on top of the game.
+   *
+   * Every load routes through runtime.handleProjectLoaded(), which emits
+   * PROJECT_LOADED, so one listener covers all of them including ones added
+   * later. Ours is the only load allowed to keep the id.
+   */
+  function forgetTargetOnForeignLoad(vm) {
+    var runtime = vm && vm.runtime;
+    if (!runtime || typeof runtime.on !== 'function') return;
+    runtime.on('PROJECT_LOADED', function () {
+      if (loadingOurProject) return;
+      currentProjectId = null;
+    });
   }
 
   function fileUrl(projectId) {
@@ -196,6 +224,14 @@
     node.dataset.kind = kind || 'idle';
   }
 
+  /** Clear a transient message after a beat, but never step on an error. */
+  function clearStatusLater(node) {
+    if (!node) return;
+    setTimeout(function () {
+      if (node.dataset.kind !== 'error') setStatus(node, '', 'idle');
+    }, 4000);
+  }
+
   // ── Which project did the LMS send us to? ───────────────────────────────
 
   function requestedProjectId() {
@@ -283,8 +319,20 @@
     try {
       var buffer = await res.arrayBuffer();
       if (!buffer || buffer.byteLength === 0) throw new Error('fichier vide');
-      await waitForFirstProject(vm);
-      await vm.loadProject(buffer);
+      // Bail rather than load into a VM that never initialised. If the GUI's
+      // own default-project load is still coming, it lands AFTER ours and
+      // leaves an empty canvas pointed at a real project: the next save then
+      // overwrites the child's game with it.
+      if (!(await waitForFirstProject(vm))) {
+        setStatus(status, 'Editeur pas prêt, recharge la page', 'error');
+        return;
+      }
+      loadingOurProject = true;
+      try {
+        await vm.loadProject(buffer);
+      } finally {
+        loadingOurProject = false;
+      }
       // Only adopt the id once the project is actually IN the editor. Adopting
       // it earlier would point the next save at a project the child never got
       // to see, and overwrite it with an empty canvas.
@@ -293,9 +341,7 @@
       var title = res.headers.get('X-Codaquest-Project-Title');
       writeTitle(title ? decodeURIComponent(title) : '');
       setStatus(status, 'Projet chargé', 'ok');
-      setTimeout(function () {
-        if (status.dataset.kind !== 'error') setStatus(status, '', 'idle');
-      }, 4000);
+      clearStatusLater(status);
     } catch (err) {
       setStatus(status, 'Echec du chargement : ' + (err && err.message ? err.message : err), 'error');
     }
@@ -358,9 +404,7 @@
       setStatus(status, 'Echec : ' + (err && err.message ? err.message : err), 'error');
     } finally {
       button.disabled = false;
-      setTimeout(function () {
-        if (status.dataset.kind !== 'error') setStatus(status, '', 'idle');
-      }, 4000);
+      clearStatusLater(status);
     }
   }
 
@@ -404,14 +448,15 @@
   function boot() {
     clearLegacyProjectId();
     var status = mountButton();
+    // Warms up the VM reference, and attaches the watcher that drops our write
+    // target the moment scratch-gui loads something else into the editor.
+    waitForVM().then(forgetTargetOnForeignLoad);
     var projectId = requestedProjectId();
     if (projectId) {
       openProject(projectId, status, document.getElementById('cq-save-button'));
-    } else {
-      // No project named, so this session starts unattached: the first save
-      // creates a new project and later saves in the same session update it.
-      waitForVM(); // warms up; the click handler re-reads window.ScratchVM
     }
+    // Otherwise this session starts unattached, so the first save creates a new
+    // project and later saves in the same session update it.
   }
 
   if (document.readyState === 'loading') {
